@@ -1,0 +1,159 @@
+from google.colab import files
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import zipfile
+import os
+import glob
+import warnings
+from IPython.display import display
+
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+sns.set_theme(style="whitegrid")
+plt.rcParams['figure.figsize'] = (12, 6)
+
+# =========================
+# 1. Upload e extração
+# =========================
+uploaded = files.upload()
+zip_filename = list(uploaded.keys())[0]
+
+extract_dir = '/content/lme_data_raw'
+os.makedirs(extract_dir, exist_ok=True)
+
+with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+    zip_ref.extractall(extract_dir)
+
+# =========================
+# 2. Leitura dos arquivos
+# =========================
+arquivos_excel = glob.glob(f'{extract_dir}/**/*.xlsx', recursive=True)
+lista_dfs = []
+
+for arquivo in arquivos_excel:
+    try:
+        df_todas_abas = pd.read_excel(arquivo, sheet_name=None, header=None)
+
+        for nome_aba, df_aba in df_todas_abas.items():
+            if 'copper' in str(nome_aba).lower():
+
+                col_data = None
+
+                # Detectar coluna de data de forma segura
+                for col in df_aba.columns:
+                    datas_convertidas = pd.to_datetime(df_aba[col], errors='coerce')
+                    if datas_convertidas.notna().sum() > 10:
+                        col_data = col
+                        break
+
+                if col_data is not None:
+                    col_preco = col_data + 2
+
+                    # Verificar se a coluna de preço realmente existe
+                    if col_preco in df_aba.columns:
+                        df_temp = df_aba[[col_data, col_preco]].copy()
+                        df_temp.columns = ['Data', 'Preco_USD']
+
+                        df_temp['Data'] = pd.to_datetime(df_temp['Data'], errors='coerce')
+                        df_temp['Preco_USD'] = pd.to_numeric(df_temp['Preco_USD'], errors='coerce')
+
+                        df_temp = df_temp.dropna(subset=['Data', 'Preco_USD'])
+
+                        if not df_temp.empty:
+                            lista_dfs.append(df_temp)
+
+    except Exception as e:
+        print(f"Erro ao processar {arquivo}: {e}")
+
+# =========================
+# 3. Consolidação
+# =========================
+if not lista_dfs:
+    raise ValueError("Nenhum dado válido encontrado nos arquivos.")
+
+df_cobre = pd.concat(lista_dfs, ignore_index=True)
+df_cobre = df_cobre.sort_values(by='Data').drop_duplicates(subset=['Data'])
+df_cobre.set_index('Data', inplace=True)
+
+# Filtro temporal seguro
+df_cobre = df_cobre.loc['2020-01-02':'2025-12-31']
+
+if df_cobre.empty:
+    raise ValueError("DataFrame ficou vazio após o filtro de datas.")
+
+# =========================
+# 4. Exportação
+# =========================
+nome_saida = 'Cobre_Consolidado_4intelligence.xlsx'
+df_cobre.to_excel(nome_saida)
+files.download(nome_saida)
+
+print("\n--- TABELA HISTÓRICA DE COTAÇÕES ---")
+display(df_cobre)
+
+# =========================
+# 5. Métricas
+# =========================
+preco_min = df_cobre['Preco_USD'].min()
+data_min = df_cobre['Preco_USD'].idxmin()
+
+preco_max = df_cobre['Preco_USD'].max()
+data_max = df_cobre['Preco_USD'].idxmax()
+
+# Mensal
+df_mensal = df_cobre.resample('M')['Preco_USD'].last()
+var_mensal = df_mensal.pct_change() * 100
+
+media_var_2020 = var_mensal[var_mensal.index.year == 2020].mean()
+media_var_2024 = var_mensal[var_mensal.index.year == 2024].mean()
+
+# Acumulada
+preco_inicial = df_cobre['Preco_USD'].iloc[0]
+preco_final = df_cobre['Preco_USD'].iloc[-1]
+var_acumulada = ((preco_final / preco_inicial) - 1) * 100
+
+print("\n--- MÉTRICAS DO CASE ---")
+print(f"1. Menor cotação: US$ {preco_min:,.2f} em {data_min.strftime('%d/%m/%Y')}")
+print(f"2. Maior cotação: US$ {preco_max:,.2f} em {data_max.strftime('%d/%m/%Y')}")
+print(f"3. Variação média mensal em 2020: {media_var_2020:+.2f}% | Em 2024: {media_var_2024:+.2f}%")
+print(f"4. Variação acumulada (2020-2025): {var_acumulada:+.2f}%")
+
+# =========================
+# 6. Gráficos
+# =========================
+fig, axes = plt.subplots(3, 1, figsize=(14, 20))
+
+# Média mensal
+media_mensal_graf = df_cobre.resample('M')['Preco_USD'].mean()
+axes[0].plot(media_mensal_graf.index, media_mensal_graf.values, linewidth=2.5)
+axes[0].set_title('Média Mensal dos Preços do Cobre à Vista (2020-2025)', fontsize=14, fontweight='bold')
+axes[0].set_ylabel('US$ / Tonelada', fontsize=12)
+axes[0].fill_between(media_mensal_graf.index, media_mensal_graf.values, alpha=0.1)
+
+# Trimestral
+trimestral_ultimo = df_cobre.resample('Q')['Preco_USD'].last()
+axes[1].plot(trimestral_ultimo.index, trimestral_ultimo.values, marker='o', linewidth=2, markersize=6)
+axes[1].set_title('Cotação do Cobre - Último Dia de Cada Trimestre', fontsize=14, fontweight='bold')
+axes[1].set_ylabel('US$ / Tonelada', fontsize=12)
+
+# Variação anual
+ultimo_dia_ano = df_cobre.resample('Y')['Preco_USD'].last()
+var_anual = ultimo_dia_ano.pct_change() * 100
+var_anual.iloc[0] = ((ultimo_dia_ano.iloc[0] / preco_inicial) - 1) * 100
+
+anos_str = var_anual.index.year.astype(str)
+barras = axes[2].bar(anos_str, var_anual, width=0.5)
+axes[2].set_title('Variação Anual dos Preços do Cobre (%)', fontsize=14, fontweight='bold')
+axes[2].set_ylabel('Variação (%)', fontsize=12)
+axes[2].axhline(0, linewidth=1.2)
+
+for barra in barras:
+    altura = barra.get_height()
+    axes[2].annotate(f'{altura:+.1f}%',
+                     xy=(barra.get_x() + barra.get_width() / 2, altura),
+                     xytext=(0, 4 if altura >= 0 else -14),
+                     textcoords="offset points",
+                     ha='center', va='bottom', fontweight='bold', fontsize=11)
+
+plt.tight_layout(pad=3.0)
+plt.show()
